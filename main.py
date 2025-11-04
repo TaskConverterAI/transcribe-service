@@ -96,10 +96,34 @@ class HealthResponse(BaseModel):
     system_info: Optional[Dict[str, Any]] = Field(None, description="Системная информация")
 
 
+# --- Модели для анализа встречи ---
+class TaskModel(BaseModel):
+    title: str = Field(..., description="Короткое название задачи")
+    description: str = Field(..., description="Полное описание / фраза из диалога")
+    assignee: str = Field("UNASSIGNED", description="Ответственный, если определен")
+    source_line: int = Field(..., description="Номер строки в исходном тексте")
+
+
+class AnalyzeRequest(BaseModel):
+    text: str = Field(..., description="Полный текст встречи. Формат: строки вида 'SPK1: текст' или произвольный текст")
+    language: Optional[str] = Field(None, description="Язык текста (по умолчанию авто)")
+    max_tasks: int = Field(20, description="Максимальное количество задач в ответе")
+    use_llm: bool = Field(True, description="Использовать LLM для саммари и извлечения задач")
+
+
+class AnalyzeResponse(BaseModel):
+    summary: str = Field(..., description="Сводное описание встречи")
+    summary_paragraphs: List[str] = Field(..., description="Абзацы саммари")
+    tasks: List[TaskModel] = Field(..., description="Извлеченные задачи")
+    participants: List[str] = Field(..., description="Список идентификаторов участников")
+    total_lines: int = Field(..., description="Количество обработанных строк")
+
+
 class TranscriptionService:
     def __init__(self):
         self.whisper_model = None
         self.diarization_pipeline = None
+        self.deepseek_client = None # клиент для задач и саммари
         self.device = self._determine_device()
         self.model_loading_lock = asyncio.Lock()
         logger.info(f"Инициализация сервиса. Устройство: {self.device}")
@@ -136,6 +160,7 @@ class TranscriptionService:
                     except Exception as auth_err:
                         logger.warning(f"Не удалось выполнить login: {auth_err}. Продолжаем без него.")
                 except ImportError:
+                    hf_login = None
                     logger.info("Функция login недоступна в установленной версии huggingface_hub.")
 
                 diarization_pipeline = Pipeline.from_pretrained(settings.diarization_model,
@@ -348,6 +373,283 @@ class TranscriptionService:
 
         return speakers_list
 
+    # --- Fallback эвристики, если LLM недоступна ---
+    def _generate_summary_paragraphs(self, speaker_text_map: Dict[str, List[str]]) -> List[str]:
+        paragraphs = []
+        for speaker, texts in speaker_text_map.items():
+            joined = ' '.join(texts)
+            if len(joined) > 800:
+                joined = joined[:800].rsplit(' ', 1)[0] + '…'
+            paragraphs.append(f"{speaker}: {joined}")
+        if len(paragraphs) < 2:
+            full_text = ' '.join([' '.join(v) for v in speaker_text_map.values()])
+            if len(full_text) > 1000:
+                full_text = full_text[:1000].rsplit(' ', 1)[0] + '…'
+            paragraphs.append(f"Общий обзор: {full_text}")
+        return paragraphs
+
+    def _extract_tasks(self, lines: List[str], max_tasks: int = 20) -> List[TaskModel]:
+        import re
+        task_keywords = [
+            'нужно', 'надо', 'сделать', 'готовим', 'подготовить', 'добавить', 'исправить', 'реализовать',
+            'проверить', 'обновить', 'запустить', 'настроить', 'создать', 'переписать'
+        ]
+        tasks: List[TaskModel] = []
+        for i, line in enumerate(lines):
+            lowered = line.lower()
+            if any(kw in lowered for kw in task_keywords):
+                if ':' in line[:30]:
+                    speaker = line.split(':', 1)[0].strip()
+                    after_colon = line.split(':', 1)[1].strip()
+                else:
+                    speaker = 'UNASSIGNED'
+                    after_colon = line
+                words = after_colon.split()
+                title = ' '.join(words[:6]) if words else 'Задача'
+                name_match = re.search(r"\b([А-ЯЁA-Z][а-яёa-z]+)\b", after_colon)
+                assignee = speaker
+                if name_match and name_match.group(1) != speaker:
+                    assignee = name_match.group(1)
+                tasks.append(TaskModel(
+                    title=title,
+                    description=after_colon,
+                    assignee=assignee or 'UNASSIGNED',
+                    source_line=i + 1
+                ))
+            if len(tasks) >= max_tasks:
+                break
+        return tasks
+
+    def _load_deepseek_client(self):
+        if self.deepseek_client is not None:
+            return
+        model_name = settings.tasks_model
+        if not model_name:
+            return
+        try:
+            api_key = settings.hf_token_env or settings.huggingface_token or os.getenv("HF_TOKEN", "")
+            if not api_key:
+                logger.warning("HF_TOKEN/HUGGINGFACE_TOKEN не задан — DeepSeek клиент не будет создан.")
+                return
+            try:
+                from openai import OpenAI
+            except ImportError:
+                OpenAI = None  # type: ignore
+                logger.error("Библиотека openai не установлена. Добавьте 'openai' в requirements.txt")
+                return
+            self.deepseek_client = OpenAI(
+                base_url="https://router.huggingface.co/v1",
+                api_key=api_key,
+            )
+            logger.info(f"OpenAI совместимый клиент инициализирован для модели {model_name}")
+        except Exception as e:
+            logger.error(f"Не удалось создать OpenAI клиент для DeepSeek: {e}")
+            self.deepseek_client = None
+
+    def _llm_extract_tasks(self, lines: List[str], max_tasks: int) -> List[TaskModel]:
+        self._load_deepseek_client()
+        if self.deepseek_client is None:
+            return self._extract_tasks(lines, max_tasks=max_tasks)
+
+        model_name = settings.tasks_model or "deepseek-ai/DeepSeek-R1"
+        if settings.tasks_provider and ':' not in model_name:
+            model_name = f"{model_name}:{settings.tasks_provider}"
+
+        numbered = [f"{i + 1}. {l}" for i, l in enumerate(lines)]
+        convo = "\n".join(numbered)
+
+        system_prompt = (
+            "Ты извлекаешь реальные задачи из диалога. Формат каждой задачи строго: \n"
+            "TASK|source_line|title|assignee|description\n"
+            "Критерии задачи: \n"
+            "- Содержит явное действие/намерение выполнить: сделать, подготовить, написать, проверить, исправить, обновить, реализовать, настроить, отправить, обсудить, внедрить.\n"
+            "- НЕ брать просто факты, вопросы, пожелания без явного обязательства.\n"
+            "- title: до 6 слов, без точки в конце.\n"
+            "- assignee: имя участника из строки или UNASSIGNED (НЕ выдумывать).\n"
+            "- description: смысл задачи из соседнего контекста И в конце ОБЯЗАТЕЛЬНО оригинальная фраза (минимально править, не сокращать смысл).\n"
+            "Если строка содержит несколько действий — выбрать наиболее явную задачу. Игнорируй условные формулировки (если, можно бы).\n"
+            "Учитывай, к кому идет обращение и бери назначение задачи исходя из ОБЩЕГО контекста.\n"
+            "Верни ТОЛЬКО строки TASK|... без пояснений и без нумерации."
+        )
+        user_prompt = f"Диалог:\n{convo}\n\nИзвлеки до {max_tasks} задач:"
+
+        def _call_model() -> str:
+            try:
+                completion = self.deepseek_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=900,
+                )
+                choice0 = completion.choices[0]
+                if hasattr(choice0, 'message') and getattr(choice0.message, 'content', None):
+                    return choice0.message.content
+                if hasattr(choice0, 'text') and choice0.text:
+                    return choice0.text
+                return str(completion)
+            except Exception as e:
+                logger.error(f"Ошибка LLM задач: {e}")
+                return ""
+
+        raw = _call_model()
+        raw = self._strip_deepseek_think(raw)
+        if not raw.strip():
+            logger.info("LLM пустой ответ по задачам — эвристика.")
+            return self._extract_tasks(lines, max_tasks=max_tasks)
+
+        tasks: Dict[tuple, TaskModel] = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("TASK|"):
+                continue
+            parts = line.split('|')
+            if len(parts) < 5:
+                continue
+            _, source_line, title, assignee, description = parts[:5]
+            try:
+                sl = int(source_line)
+            except ValueError:
+                sl = 0
+            key = (sl, title.strip())
+            if key in tasks:
+                continue
+            tasks[key] = TaskModel(
+                title=(title.strip() or 'Задача')[:100],
+                description=description.strip(),
+                assignee=assignee.strip() or 'UNASSIGNED',
+                source_line=sl
+            )
+            if len(tasks) >= max_tasks:
+                break
+
+        if not tasks:
+            logger.info("LLM не вернул валидные задачи — эвристика.")
+            return self._extract_tasks(lines, max_tasks=max_tasks)
+        return sorted(tasks.values(), key=lambda t: (t.source_line, t.title))[:max_tasks]
+
+    def _llm_summarize(self, speaker_text_map: Dict[str, List[str]]) -> List[str]:
+        self._load_deepseek_client()
+        if self.deepseek_client is None:
+            # fallback: эвристика
+            return self._generate_summary_paragraphs(speaker_text_map)
+
+        joined = []
+        for spk, txts in speaker_text_map.items():
+            snippet = ' '.join(txts)
+            if len(snippet) > 5000:
+                snippet = snippet[:5000].rsplit(' ', 1)[0] + '…'
+            joined.append(f"{spk}: {snippet}")
+        convo = "\n".join(joined)
+        if len(convo) > 15000:
+            convo = convo[:15000].rsplit(' ', 1)[0] + '…'
+
+        model_name = settings.tasks_model or "deepseek-ai/DeepSeek-R1"
+        if settings.tasks_provider and ':' not in model_name:
+            model_name = f"{model_name}:{settings.tasks_provider}"
+
+        system_prompt = (
+            "Ты аналитик встреч. Получаешь диалог и возвращаешь структурированное краткое саммари. Формат вывода строками: \n"
+            "[Общее резюме]\n(1 абзац)\n"
+            "[Ключевые решения]\n- пункт 1\n- пункт 2\n"
+            "[Основные темы]\n- тема 1\n- тема 2\n"
+            "Требования: не выдумывай факты, не копируй длинные куски, сохраняй смысл; максимум 6-10 пунктов суммарно."
+        )
+        user_prompt = f"Диалог:\n{convo}\n\nСформируй саммари."
+
+        def _call_model() -> str:
+            try:
+                completion = self.deepseek_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.3,
+                    max_tokens=800,
+                )
+                choice0 = completion.choices[0]
+                if hasattr(choice0, 'message') and getattr(choice0.message, 'content', None):
+                    return choice0.message.content
+                if hasattr(choice0, 'text') and choice0.text:
+                    return choice0.text
+                return str(completion)
+            except Exception as e:
+                logger.error(f"Ошибка LLM саммари: {e}")
+                return ""
+
+        raw = _call_model()
+        raw = self._strip_deepseek_think(raw)
+        if not raw.strip():
+            logger.info("LLM пустой ответ саммари — fallback эвристика.")
+            return self._generate_summary_paragraphs(speaker_text_map)
+
+        # Разбиваем на строки/абзацы, убираем пустые
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        # Ограничим до 20
+        return lines[:20]
+
+    def _strip_deepseek_think(self, text: str) -> str:
+        """Удаляет внутреннее рассуждение DeepSeek (think часть) оставляя только финальный вывод.
+        Удаляются:
+        - блоки <think>...</think>
+        - строки начинающиеся с Thought:/Thinking:/Reasoning:/Analysis:
+        - строки вида Internal reasoning ...
+        """
+        if not text:
+            return text
+        import re
+        text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+        cleaned_lines: List[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.match(r'^(thought|thinking|reasoning|analysis)[:\-]', stripped, flags=re.IGNORECASE):
+                continue
+            if stripped.lower().startswith('internal reasoning'):
+                continue
+            # Часто DeepSeek может вставлять маркер "Final Answer:" — уберём сам маркер
+            if stripped.lower().startswith('final answer:'):
+                stripped = stripped[len('final answer:'):].strip()
+            cleaned_lines.append(stripped)
+        # Удаляем ведущие служебные слова Answer:/Ответ:
+        if cleaned_lines and re.match(r'^(answer|ответ)[:\-]', cleaned_lines[0], flags=re.IGNORECASE):
+            cleaned_lines[0] = re.sub(r'^(answer|ответ)[:\-]\s*', '', cleaned_lines[0], flags=re.IGNORECASE)
+        return '\n'.join(cleaned_lines).strip()
+
+    def analyze_text(self, req: AnalyzeRequest) -> AnalyzeResponse:
+        raw_text = req.text.strip()
+        if not raw_text:
+            raise HTTPException(status_code=400, detail="Пустой текст для анализа")
+
+        lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+        speaker_text_map: Dict[str, List[str]] = {}
+        for line in lines:
+            if ':' in line[:30]:
+                prefix, content = line.split(':', 1)
+                speaker = prefix.strip()
+                text_part = content.strip()
+            else:
+                speaker = 'UNKNOWN'
+                text_part = line
+            speaker_text_map.setdefault(speaker, []).append(text_part)
+        participants = list(speaker_text_map.keys())
+
+        summary_paragraphs = self._llm_summarize(speaker_text_map)
+        tasks = self._llm_extract_tasks(lines, max_tasks=req.max_tasks)
+
+        summary = '\n'.join(summary_paragraphs)
+        return AnalyzeResponse(
+            summary=summary,
+            summary_paragraphs=summary_paragraphs,
+            tasks=tasks,
+            participants=participants,
+            total_lines=len(lines)
+        )
+
 
 transcription_service = TranscriptionService()
 
@@ -358,7 +660,8 @@ async def root():
         "message": "TranscribeAPI",
         "version": "1.0.0",
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "analyze": "/analyze"
     }
 
 
@@ -392,6 +695,17 @@ async def health_check():
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(file: UploadFile = File(..., description="Аудио файл для транскрибации")):
     return await transcription_service.process_audio_file(file)
+
+
+@app.post("/analyze", response_model=AnalyzeResponse, summary="Анализ текста встречи")
+async def analyze_meeting(req: AnalyzeRequest):
+    try:
+        return transcription_service.analyze_text(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Ошибка анализа текста")
+        raise HTTPException(status_code=500, detail=f"Ошибка анализа: {e}")
 
 
 if __name__ == "__main__":

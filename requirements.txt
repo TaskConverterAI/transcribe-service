@@ -13,6 +13,8 @@ torchaudio==2.1.0
 numpy>=1.21.0,<2.0.0
 
 pyannote.audio==3.1.1
-huggingface_hub==0.19.4  # Совместимо с параметром use_auth_token
+huggingface_hub==0.24.0  # обновлено для InferenceClient
 
 python-dotenv==1.0.0
+transformers==4.35.0
+openai>=1.0.0
