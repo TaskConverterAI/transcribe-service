@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import json
 import zipfile
 import urllib.request
+import pyannote.audio
 from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
 from pyannote.audio import Audio
 from pyannote.core import Segment
@@ -536,7 +537,7 @@ class TranscriptionService:
         model_name = model or settings.tasks_model
         try:
             resp = self.llm_model.chat(model_name, messages=messages, format="json")
-            return resp.message.content
+            return resp["message"]["content"]
         except Exception as e:
             logger.error(f"Ошибка вызова LLM: {e}")
             return ''
@@ -552,7 +553,7 @@ class TranscriptionService:
         convo = "\n".join(numbered)
         system_prompt = (
             "Ты извлекаешь реальные задачи из диалога. Формат: TASK|source_line|title|assignee|description. Только такие строки." \
-            " title ≤6 слов; assignee из строки или UNASSIGNED; description заканчивается оригинальной фразой. Игнорируй факты и вопросы.")
+            " title ≤6 слов; assignee из строки или UNASSIGNED; description заканчивается оригинальной фразой. Игнорируй факты и вопросы. Отвечай исключительно на РУССКОМ языке")
         user_prompt = f"Диалог:\n{convo}\n\nИзвлеки до {max_tasks} задач:"
         raw = self._llm_chat([
             {"role": "system", "content": system_prompt},
