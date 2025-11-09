@@ -5,13 +5,21 @@ import tempfile
 import time
 import logging
 from contextlib import asynccontextmanager
-import functools
+import json
+import zipfile
+import urllib.request
+from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+from pyannote.audio import Audio
+from pyannote.core import Segment
 
 import torch
-import whisper
 import librosa
 import soundfile as sf
-from pyannote.audio import Pipeline
+import vosk
+import webrtcvad
+import numpy as np
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score
 from fastapi import FastAPI, File, UploadFile, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -21,6 +29,10 @@ from config import get_settings, setup_logging
 settings = get_settings()
 setup_logging(settings.log_level)
 logger = logging.getLogger(__name__)
+
+embedding_model = PretrainedSpeakerEmbedding(
+    "speechbrain/spkrec-ecapa-voxceleb",
+    device=torch.device("cpu" if torch.cuda.is_available() else "cpu"))
 
 
 @asynccontextmanager
@@ -39,7 +51,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TranscribeAPI",
-    description="API для транскрибации аудио с диаризацией спикеров",
+    description="API для транскрибации а��дио с диаризацией спикеров",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -71,12 +83,9 @@ class SpeakerModel(BaseModel):
 
 
 class ModelInfoModel(BaseModel):
-    whisper_model: str = Field(..., description="Используемая модель Whisper")
-    diarization_model: str = Field(..., description="Используемая модель диаризации")
-    device: str = Field(..., description="Устройство обработки (CPU/GPU)")
-    whisper_processing_time: float = Field(..., description="Время транскрибации")
-    diarization_processing_time: float = Field(..., description="Время диаризации")
-    alignment_processing_time: float = Field(..., description="Время совмещения")
+    transcribe_backend: str = Field(..., description="InferenceClient репозиторий")
+    diarization_model: str = Field(..., description="Модель диаризации")
+    device: str = Field(..., description="Устройство диаризации (CPU/GPU)")
 
 
 class TranscriptionResponse(BaseModel):
@@ -84,7 +93,7 @@ class TranscriptionResponse(BaseModel):
     speakers: List[SpeakerModel] = Field(..., description="Информация о спикерах")
     segments: List[SegmentModel] = Field(..., description="Сегменты с привязкой к спикерам")
     processing_time: float = Field(..., description="Общее время обработки в секундах")
-    audio_duration: float = Field(..., description="Длительность аудио в секундах")
+    duration: float = Field(..., description="Длительность аудио в секундах")
     language: str = Field(..., description="Определенный язык")
     ai_info: ModelInfoModel = Field(..., description="Информация о моделях и производительности")
 
@@ -121,66 +130,11 @@ class AnalyzeResponse(BaseModel):
 
 class TranscriptionService:
     def __init__(self):
-        self.whisper_model = None
-        self.diarization_pipeline = None
-        self.deepseek_client = None # клиент для задач и саммари
+        self.transcribe_model = None
+        self.llm_model = None
         self.device = self._determine_device()
         self.model_loading_lock = asyncio.Lock()
         logger.info(f"Инициализация сервиса. Устройство: {self.device}")
-
-    def _determine_device(self) -> str:
-        if settings.device == "auto":
-            if torch.cuda.is_available():
-                return "cuda"
-            else:
-                return "cpu"
-        return settings.device
-
-    async def load_models(self):
-        async with self.model_loading_lock:
-            if self.whisper_model is not None and self.diarization_pipeline is not None:
-                return
-
-            try:
-                logger.info("Начало загрузки моделей...")
-
-                logger.info(f"Загрузка Whisper модели: {settings.whisper_model}")
-                self.whisper_model = whisper.load_model(settings.whisper_model, device=self.device)
-                logger.info("Whisper модель загружена")
-
-                logger.info("Загрузка модели диаризации...")
-                if not settings.huggingface_token:
-                    raise ValueError("HUGGINGFACE_TOKEN не установлен в переменных окружения")
-
-                try:
-                    from huggingface_hub import login as hf_login
-                    try:
-                        hf_login(token=settings.huggingface_token, add_to_git_credential=False)
-                        logger.info("Аутентификация через huggingface_hub.login выполнена.")
-                    except Exception as auth_err:
-                        logger.warning(f"Не удалось выполнить login: {auth_err}. Продолжаем без него.")
-                except ImportError:
-                    hf_login = None
-                    logger.info("Функция login недоступна в установленной версии huggingface_hub.")
-
-                diarization_pipeline = Pipeline.from_pretrained(settings.diarization_model,
-                                                                use_auth_token=settings.huggingface_token)
-
-                if diarization_pipeline is None:
-                    raise RuntimeError("Не удалось загрузить модель диаризации ни одним доступным способом.")
-
-                self.diarization_pipeline = diarization_pipeline
-
-                if self.device == "cuda" and self.diarization_pipeline is not None:
-                    self.diarization_pipeline = self.diarization_pipeline.to(torch.device("cuda"))
-
-                logger.info("Все модели загружены")
-
-            except Exception as e:
-                logger.error(f"Ошибка загрузки моделей: {e}")
-                self.whisper_model = None
-                self.diarization_pipeline = None
-                raise e
 
     @staticmethod
     def validate_audio_file(file: UploadFile) -> None:
@@ -198,86 +152,6 @@ class TranscriptionService:
                 detail=f"Файл слишком большой. Максимальный размер: {settings.max_file_size // (1024 * 1024)}MB"
             )
 
-    async def process_audio_file(self, file: UploadFile) -> TranscriptionResponse:
-        start_time = time.time()
-        temp_files = []
-
-        try:
-            if not self.whisper_model or not self.diarization_pipeline:
-                await self.load_models()
-
-            self.validate_audio_file(file)
-
-            temp_input = tempfile.NamedTemporaryFile(delete=False, suffix='.tmp')
-            temp_files.append(temp_input.name)
-
-            content = await file.read()
-            temp_input.write(content)
-            temp_input.close()
-
-            # Предобработка
-            processed_audio = self._preprocess_audio(temp_input.name)
-            temp_files.append(processed_audio)
-
-            # Получение длительности
-            audio_duration = librosa.get_duration(path=processed_audio)
-            logger.info(f"Обработка аудио длительностью {audio_duration:.2f}с")
-
-            # Параллельная обработка
-            whisper_task = asyncio.create_task(self._transcribe_async(processed_audio))
-            diarization_task = asyncio.create_task(self._diarize_async(processed_audio))
-
-            whisper_result, diarization_result = await asyncio.gather(
-                whisper_task, diarization_task
-            )
-
-            # Совмещение результатов
-            alignment_start = time.time()
-            segments_with_speakers = self._align_transcription_with_speakers(
-                whisper_result['result'], diarization_result['result']
-            )
-            alignment_time = time.time() - alignment_start
-
-            # Сводка по спикерам
-            speakers_summary = self._get_speakers_summary(segments_with_speakers)
-
-            # Формирование ответа
-            total_time = time.time() - start_time
-
-            response = TranscriptionResponse(
-                text=whisper_result['result']['text'],
-                speakers=speakers_summary,
-                segments=segments_with_speakers,
-                processing_time=round(total_time, 2),
-                audio_duration=round(audio_duration, 2),
-                language=whisper_result['result'].get('language', 'unknown'),
-                ai_info=ModelInfoModel(
-                    whisper_model=settings.whisper_model,
-                    diarization_model="pyannote/speaker-diarization-3.1",
-                    device=self.device,
-                    whisper_processing_time=round(whisper_result['time'], 2),
-                    diarization_processing_time=round(diarization_result['time'], 2),
-                    alignment_processing_time=round(alignment_time, 2)
-                )
-            )
-
-            logger.info(f"Обработка завершена за {total_time:.2f}с")
-            return response
-
-        except Exception as e:
-            logger.error(f"Ошибка обработки: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Ошибка обработки аудио: {str(e)}"
-            )
-        finally:
-            for temp_file in temp_files:
-                try:
-                    if os.path.exists(temp_file):
-                        os.unlink(temp_file)
-                except Exception as e:
-                    logger.warning(f"Не удалось удалить {temp_file}: {e}")
-
     @staticmethod
     def _preprocess_audio(file_path: str) -> str:
         try:
@@ -292,57 +166,318 @@ class TranscriptionService:
                 detail=f"Ошибка предобработки аудио: {str(e)}"
             )
 
-    async def _transcribe_async(self, audio_path: str) -> Dict[str, Any]:
-        start_time = time.time()
-        loop = asyncio.get_event_loop()
-        fn = functools.partial(
-            self.whisper_model.transcribe,
-            audio_path,
-            language='ru',
-            task='transcribe',
-            word_timestamps=True
-        )
-        result = await loop.run_in_executor(None, fn)
-        processing_time = time.time() - start_time
-        return {'result': result, 'time': processing_time}
-
-    async def _diarize_async(self, audio_path: str) -> Dict[str, Any]:
-        start_time = time.time()
-        loop = asyncio.get_event_loop()
-        fn = functools.partial(self.diarization_pipeline, audio_path)
-        result = await loop.run_in_executor(None, fn)
-        processing_time = time.time() - start_time
-        return {'result': result, 'time': processing_time}
-
-    def _align_transcription_with_speakers(self, whisper_result: Dict, diarization: Any) -> List[SegmentModel]:
-        segments_with_speakers = []
-
-        for segment in whisper_result['segments']:
-            start_time = segment['start']
-            end_time = segment['end']
-            text = segment['text'].strip()
-
-            speaker = self._find_speaker_for_segment(diarization, start_time, end_time)
-
-            segments_with_speakers.append(SegmentModel(
-                start=start_time,
-                end=end_time,
-                text=text,
-                speaker=speaker,
-                confidence=segment.get('avg_logprob', 0)
-            ))
-
-        return segments_with_speakers
+    @staticmethod
+    def _determine_device() -> str:
+        if settings.device == "auto":
+            if torch.cuda.is_available():
+                return "cuda"
+            else:
+                return "cpu"
+        return settings.device
 
     @staticmethod
-    def _find_speaker_for_segment(diarization: Any, start_time: float, end_time: float) -> str:
-        segment_center = (start_time + end_time) / 2
+    async def _download_transcribe_model():
+        """Загружает модель, если она не существует"""
+        if os.path.exists(settings.transcribe_model_path):
+            return
 
-        for segment, _, speaker in diarization.itertracks(yield_label=True):
-            if segment.start <= segment_center <= segment.end:
-                return speaker
+        logger.info(f"Загрузка модели транскрибации из {settings.transcribe_model_url}")
+        os.makedirs(os.path.dirname(settings.transcribe_model_path), exist_ok=True)
 
-        return "UNKNOWN"
+        # Загружаем и распаковываем модель
+        zip_path = f"{settings.transcribe_model_path}.zip"
+        urllib.request.urlretrieve(settings.transcribe_model_url, zip_path)
+
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(os.path.dirname(settings.transcribe_model_path))
+
+        # Переименовываем папку в нужное имя
+        extracted_folder = None
+        for item in os.listdir(os.path.dirname(settings.transcribe_model_path)):
+            if item.startswith("vosk-model"):
+                extracted_folder = os.path.join(os.path.dirname(settings.transcribe_model_path), item)
+                break
+
+        if extracted_folder and extracted_folder != settings.transcribe_model_path:
+            os.rename(extracted_folder, settings.transcribe_model_path)
+
+        os.unlink(zip_path)
+        logger.info("Модель транскрибации успешно загружена")
+
+
+    def _load_ollama_client(self):
+        """Инициализирует Ollama client для задач и саммари."""
+        if self.llm_model is not None:
+            return
+        model_name = settings.tasks_model
+        if not model_name:
+            logger.warning("tasks_model не задан — LLM клиент не будет создан.")
+            return
+        try:
+            try:
+                from ollama import Client  # type: ignore
+            except ImportError:
+                logger.error("Библиотека ollama не установлена. Добавьте 'ollama' в requirements.txt")
+                return
+            headers = {}
+            if settings.ollama_api_key:
+                headers['Authorization'] = 'Bearer ' + settings.ollama_api_key
+            host = settings.ollama_base_url.rstrip('/')
+            self.llm_model = Client(host=host, headers=headers if headers else None)
+            logger.info(f"Ollama клиент инициализирован: host={host}, model={model_name}")
+
+        except Exception as e:
+            logger.error(f"Не удалось создать LLM клиент: {e}")
+            self.llm_model = None
+
+    async def load_models(self):
+        async with self.model_loading_lock:
+            if self.transcribe_model is not None:
+                return
+
+            try:
+                logger.info("Начало загрузки модели транскрибации...")
+                await self._download_transcribe_model()
+
+                if not os.path.exists(settings.transcribe_model_path):
+                    raise ValueError(f"Модель для транскрибации не найдена по пути: {settings.transcribe_model_path}")
+
+                self.transcribe_model = vosk.Model(settings.transcribe_model_path)
+                logger.info("Модель для транскрибации загружена успешно")
+
+            except Exception as e:
+                logger.error(f"Ошибка загрузки модели транскрибации: {e}")
+                self.transcribe_model = None
+                raise e
+
+    @staticmethod
+    def _segments_from_text_with_diarization(full_text: str, diarization: Any) -> List[SegmentModel]:
+        # Простая нарезка текста по диаризации: каждая метка спикера получает свой кусок (делим равномерно)
+        if not full_text:
+            # создаём сегменты без текста
+            blank = []
+            for segment, _, speaker in diarization.itertracks(yield_label=True):
+                blank.append(
+                    SegmentModel(start=segment.start, end=segment.end, text='', speaker=speaker, confidence=0.0))
+            return blank
+        words = full_text.split()
+        total_words = len(words)
+        diar_segments = list(diarization.itertracks(yield_label=True))
+        if not diar_segments:
+            return [SegmentModel(start=0.0, end=max(len(full_text) / 10.0, 0.1), text=full_text, speaker='SPK1',
+                                 confidence=0.0)]
+        alloc = []
+        # Распределяем слова пропорционально длительности сегмента
+        total_duration = sum((seg.end - seg.start) for seg, _, _ in diar_segments)
+        used = 0
+        for i, (seg, _, speaker) in enumerate(diar_segments):
+            duration = seg.end - seg.start
+            if total_duration <= 0:
+                share = total_words // len(diar_segments)
+            else:
+                share = int(round((duration / total_duration) * total_words))
+            if i == len(diar_segments) - 1:
+                share = total_words - used
+            segment_words = words[used: used + share]
+            used += share
+            alloc.append(SegmentModel(
+                start=seg.start,
+                end=seg.end,
+                text=' '.join(segment_words).strip(),
+                speaker=speaker,
+                confidence=0.0
+            ))
+        return alloc
+
+    def _voice_activity_detection(self, audio_data: bytes, sample_rate: int = 16000) -> List[tuple]:
+        """Детекция голосовой активности с помощью WebRTC VAD"""
+        vad = webrtcvad.Vad()
+        vad.set_mode(3)  # Самый агрессивный режим
+
+        # Размер фрейма для VAD (10, 20 или 30 мс)
+        frame_duration = 30  # мс
+        frame_size = int(sample_rate * frame_duration / 1000)
+
+        speech_segments = []
+        current_segment_start = None
+
+        for i in range(0, len(audio_data), frame_size * 2):  # *2 для 16-bit audio
+            frame = audio_data[i:i + frame_size * 2]
+            if len(frame) < frame_size * 2:
+                break
+
+            timestamp = i / (sample_rate * 2)
+
+            try:
+                is_speech = vad.is_speech(frame, sample_rate)
+
+                if is_speech and current_segment_start is None:
+                    current_segment_start = timestamp
+                elif not is_speech and current_segment_start is not None:
+                    speech_segments.append((current_segment_start, timestamp))
+                    current_segment_start = None
+            except:
+                # Если VAD не работает с этим фреймом, считаем его речью
+                if current_segment_start is None:
+                    current_segment_start = timestamp
+
+        # Закрываем последний сегмент если он остался открытым
+        if current_segment_start is not None:
+            speech_segments.append((current_segment_start, len(audio_data) / (sample_rate * 2)))
+
+        return speech_segments
+
+    async def _transcribe_async(self, audio_path: str) -> Dict[str, Any]:
+        """Транскрибация одним блоком (без почанковой разбивки)."""
+        start_time = time.time()
+        if not self.transcribe_model:
+            await self.load_models()
+        loop = asyncio.get_event_loop()
+
+        def _vosk_transcribe():
+            audio_data, sample_rate = librosa.load(audio_path, sr=16000)
+            audio_bytes = (audio_data * 32767).astype('int16').tobytes()
+
+            recognizer = vosk.KaldiRecognizer(self.transcribe_model, 16000)
+
+            results = []
+            frame_size = 4000  # размер чанка для обработки
+
+            # Обрабатываем аудио чанками
+            for i in range(0, len(audio_bytes), frame_size):
+                chunk = audio_bytes[i:i + frame_size]
+
+                if recognizer.AcceptWaveform(chunk):
+                    result = json.loads(recognizer.Result())
+                    if result.get('text'):
+                        # Добавляем временные метки
+                        timestamp = i / (16000 * 2)  # 2 bytes per sample for 16-bit
+                        result['start'] = timestamp
+                        result['end'] = timestamp + len(chunk) / (16000 * 2)
+                        results.append(result)
+            """
+            # Обрабатываем последний чанк
+            final_result = json.loads(recognizer.FinalResult())
+            if final_result.get('text'):
+                results.append(final_result)
+            """
+            return results
+
+        vosk_results = await loop.run_in_executor(None, _vosk_transcribe)
+        processing_time = time.time() - start_time
+
+        full_text = ' '.join([r.get('text', '') for r in vosk_results if r.get('text')])
+
+        return {
+            'result': full_text,
+            'time': processing_time,
+            'segments': vosk_results
+        }
+
+    async def process_audio_file(self, file: UploadFile) -> TranscriptionResponse:
+        start_time = time.time()
+        temp_files: List[str] = []
+        try:
+            if not self.transcribe_model:
+                await self.load_models()
+            self.validate_audio_file(file)
+            tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix='.input')
+            temp_files.append(tmp_in.name)
+            content = await file.read()
+            tmp_in.write(content)
+            tmp_in.close()
+            processed = self._preprocess_audio(tmp_in.name)
+            temp_files.append(processed)
+            duration = librosa.get_duration(path=processed)
+
+            transcribe_result = await self._transcribe_async(processed)
+
+            segments = transcribe_result['segments']
+            print(segments)
+            # Create embedding
+            def segment_embedding(segment):
+                audio = Audio()
+                start = segment["start"]
+                print(start)
+                # Whisper overshoots the end timestamp in the last segment
+                end = min(duration, segment["end"])
+                clip = Segment(start, end)
+                waveform, sample_rate = audio.crop(processed, clip)
+                return embedding_model(waveform[None])
+
+            embeddings = np.zeros(shape=(len(segments), 192))
+            for i, segment in enumerate(segments):
+                print("segment", segment)
+                embeddings[i] = segment_embedding(segment)
+                embeddings[i] = segment_embedding(segment)
+            embeddings = np.nan_to_num(embeddings)
+            print(f'Embedding shape: {embeddings.shape}')
+
+            # Find the best number of speakers
+            score_num_speakers = {}
+
+            for num_speakers in range(2, 10 + 1):
+                clustering = AgglomerativeClustering(num_speakers).fit(embeddings)
+                score = silhouette_score(embeddings, clustering.labels_, metric='euclidean')
+                score_num_speakers[num_speakers] = score
+            best_num_speaker = max(score_num_speakers, key=lambda x: score_num_speakers[x])
+            print(
+                f"The best number of speakers: {best_num_speaker} with {score_num_speakers[best_num_speaker]} score")
+
+            # Assign speaker label - создаём новые словари с назначенными спикерами
+            clustering = AgglomerativeClustering(best_num_speaker).fit(embeddings)
+            labels = clustering.labels_
+
+            # Создаём новый список сегментов с назначенными спикерами
+            segments_with_speakers = []
+            for i, segment in enumerate(segments):
+                segment_with_speaker = {
+                    'start': segment.get('start', 0.0),
+                    'end': segment.get('end', 0.0),
+                    'text': segment.get('text', ''),
+                    'speaker': 'SPEAKER ' + str(labels[i] + 1),
+                    'confidence': 0.0
+                }
+                segments_with_speakers.append(segment_with_speaker)
+
+            # Преобразуем словари в объекты SegmentModel
+            segment_models = []
+            for seg_dict in segments_with_speakers:
+                segment_models.append(SegmentModel(
+                    start=seg_dict['start'],
+                    end=seg_dict['end'],
+                    text=seg_dict['text'],
+                    speaker=seg_dict['speaker'],
+                    confidence=seg_dict['confidence']
+                ))
+
+            speakers_summary = self._get_speakers_summary(segment_models)
+            total_time = time.time() - start_time
+            resp = TranscriptionResponse(
+                text=transcribe_result['result'] or '',
+                speakers=speakers_summary,
+                segments=segment_models,  # Используем преобразованные объекты
+                processing_time=round(total_time, 2),
+                duration=round(duration, 2),
+                language='ru',
+                ai_info=ModelInfoModel(
+                    transcribe_backend='Vosk',
+                    diarization_model='VAD + MFCC clustering',
+                    device=self.device
+                )
+            )
+            logger.info(f"Транскрипция завершена за {total_time:.2f}s")
+            return resp
+        except Exception as e:
+            logger.error(f"Ошибка обработки аудио: {e}")
+            raise HTTPException(status_code=500, detail=f"Ошибка обработки аудио: {e}")
+        finally:
+            for f in temp_files:
+                try:
+                    if os.path.exists(f):
+                        os.unlink(f)
+                except Exception:
+                    pass
 
     @staticmethod
     def _get_speakers_summary(segments: List[SegmentModel]) -> List[SpeakerModel]:
@@ -373,132 +508,58 @@ class TranscriptionService:
 
         return speakers_list
 
-    # --- Fallback эвристики, если LLM недоступна ---
-    def _generate_summary_paragraphs(self, speaker_text_map: Dict[str, List[str]]) -> List[str]:
-        paragraphs = []
-        for speaker, texts in speaker_text_map.items():
-            joined = ' '.join(texts)
-            if len(joined) > 800:
-                joined = joined[:800].rsplit(' ', 1)[0] + '…'
-            paragraphs.append(f"{speaker}: {joined}")
-        if len(paragraphs) < 2:
-            full_text = ' '.join([' '.join(v) for v in speaker_text_map.values()])
-            if len(full_text) > 1000:
-                full_text = full_text[:1000].rsplit(' ', 1)[0] + '…'
-            paragraphs.append(f"Общий обзор: {full_text}")
-        return paragraphs
-
-    def _extract_tasks(self, lines: List[str], max_tasks: int = 20) -> List[TaskModel]:
+    @staticmethod
+    def _strip_llm_think(text: str) -> str:
+        """Удаляет внутреннее рассуждение (think) оставляя финальный вывод."""
+        if not text:
+            return text
         import re
-        task_keywords = [
-            'нужно', 'надо', 'сделать', 'готовим', 'подготовить', 'добавить', 'исправить', 'реализовать',
-            'проверить', 'обновить', 'запустить', 'настроить', 'создать', 'переписать'
-        ]
-        tasks: List[TaskModel] = []
-        for i, line in enumerate(lines):
-            lowered = line.lower()
-            if any(kw in lowered for kw in task_keywords):
-                if ':' in line[:30]:
-                    speaker = line.split(':', 1)[0].strip()
-                    after_colon = line.split(':', 1)[1].strip()
-                else:
-                    speaker = 'UNASSIGNED'
-                    after_colon = line
-                words = after_colon.split()
-                title = ' '.join(words[:6]) if words else 'Задача'
-                name_match = re.search(r"\b([А-ЯЁA-Z][а-яёa-z]+)\b", after_colon)
-                assignee = speaker
-                if name_match and name_match.group(1) != speaker:
-                    assignee = name_match.group(1)
-                tasks.append(TaskModel(
-                    title=title,
-                    description=after_colon,
-                    assignee=assignee or 'UNASSIGNED',
-                    source_line=i + 1
-                ))
-            if len(tasks) >= max_tasks:
-                break
-        return tasks
+        text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+        cleaned_lines: List[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.match(r'^(thought|thinking|reasoning|analysis)[:\-]', stripped, flags=re.IGNORECASE):
+                continue
+            if stripped.lower().startswith('internal reasoning'):
+                continue
+            if stripped.lower().startswith('final answer:'):
+                stripped = stripped[len('final answer:'):].strip()
+            cleaned_lines.append(stripped)
+        if cleaned_lines and re.match(r'^(answer|ответ)[:\-]', cleaned_lines[0], flags=re.IGNORECASE):
+            cleaned_lines[0] = re.sub(r'^(answer|ответ)[:\-]\s*', '', cleaned_lines[0], flags=re.IGNORECASE)
+        return '\n'.join(cleaned_lines).strip()
 
-    def _load_deepseek_client(self):
-        if self.deepseek_client is not None:
-            return
-        model_name = settings.tasks_model
-        if not model_name:
-            return
+    def _llm_chat(self, messages: List[Dict[str, str]], model: Optional[str] = None) -> str:
+        self._load_ollama_client()
+        if self.llm_model is None:
+            return ''
+        model_name = model or settings.tasks_model
         try:
-            api_key = settings.hf_token_env or settings.huggingface_token or os.getenv("HF_TOKEN", "")
-            if not api_key:
-                logger.warning("HF_TOKEN/HUGGINGFACE_TOKEN не задан — DeepSeek клиент не будет создан.")
-                return
-            try:
-                from openai import OpenAI
-            except ImportError:
-                OpenAI = None  # type: ignore
-                logger.error("Библиотека openai не установлена. Добавьте 'openai' в requirements.txt")
-                return
-            self.deepseek_client = OpenAI(
-                base_url="https://router.huggingface.co/v1",
-                api_key=api_key,
-            )
-            logger.info(f"OpenAI совместимый клиент инициализирован для модели {model_name}")
+            resp = self.llm_model.chat(model_name, messages=messages, format="json")
+            return resp.message.content
         except Exception as e:
-            logger.error(f"Не удалось создать OpenAI клиент для DeepSeek: {e}")
-            self.deepseek_client = None
+            logger.error(f"Ошибка вызова LLM: {e}")
+            return ''
 
     def _llm_extract_tasks(self, lines: List[str], max_tasks: int) -> List[TaskModel]:
-        self._load_deepseek_client()
-        if self.deepseek_client is None:
-            return self._extract_tasks(lines, max_tasks=max_tasks)
+        raw_lines = lines
+        self._load_ollama_client()
+        if self.llm_model is None:
+            logger.info("LLM модель не задана.")
+            return []
 
-        model_name = settings.tasks_model or "deepseek-ai/DeepSeek-R1"
-        if settings.tasks_provider and ':' not in model_name:
-            model_name = f"{model_name}:{settings.tasks_provider}"
-
-        numbered = [f"{i + 1}. {l}" for i, l in enumerate(lines)]
+        numbered = [f"{i + 1}. {l}" for i, l in enumerate(raw_lines)]
         convo = "\n".join(numbered)
-
         system_prompt = (
-            "Ты извлекаешь реальные задачи из диалога. Формат каждой задачи строго: \n"
-            "TASK|source_line|title|assignee|description\n"
-            "Критерии задачи: \n"
-            "- Содержит явное действие/намерение выполнить: сделать, подготовить, написать, проверить, исправить, обновить, реализовать, настроить, отправить, обсудить, внедрить.\n"
-            "- НЕ брать просто факты, вопросы, пожелания без явного обязательства.\n"
-            "- title: до 6 слов, без точки в конце.\n"
-            "- assignee: имя участника из строки или UNASSIGNED (НЕ выдумывать).\n"
-            "- description: смысл задачи из соседнего контекста И в конце ОБЯЗАТЕЛЬНО оригинальная фраза (минимально править, не сокращать смысл).\n"
-            "Если строка содержит несколько действий — выбрать наиболее явную задачу. Игнорируй условные формулировки (если, можно бы).\n"
-            "Учитывай, к кому идет обращение и бери назначение задачи исходя из ОБЩЕГО контекста.\n"
-            "Верни ТОЛЬКО строки TASK|... без пояснений и без нумерации."
-        )
+            "Ты извлекаешь реальные задачи из диалога. Формат: TASK|source_line|title|assignee|description. Только такие строки." \
+            " title ≤6 слов; assignee из строки или UNASSIGNED; description заканчивается оригинальной фразой. Игнорируй факты и вопросы.")
         user_prompt = f"Диалог:\n{convo}\n\nИзвлеки до {max_tasks} задач:"
-
-        def _call_model() -> str:
-            try:
-                completion = self.deepseek_client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.2,
-                    max_tokens=900,
-                )
-                choice0 = completion.choices[0]
-                if hasattr(choice0, 'message') and getattr(choice0.message, 'content', None):
-                    return choice0.message.content
-                if hasattr(choice0, 'text') and choice0.text:
-                    return choice0.text
-                return str(completion)
-            except Exception as e:
-                logger.error(f"Ошибка LLM задач: {e}")
-                return ""
-
-        raw = _call_model()
-        raw = self._strip_deepseek_think(raw)
-        if not raw.strip():
-            logger.info("LLM пустой ответ по задачам — эвристика.")
-            return self._extract_tasks(lines, max_tasks=max_tasks)
+        raw = self._llm_chat([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ], model=settings.tasks_model)
 
         tasks: Dict[tuple, TaskModel] = {}
         for line in raw.splitlines():
@@ -525,17 +586,9 @@ class TranscriptionService:
             if len(tasks) >= max_tasks:
                 break
 
-        if not tasks:
-            logger.info("LLM не вернул валидные задачи — эвристика.")
-            return self._extract_tasks(lines, max_tasks=max_tasks)
         return sorted(tasks.values(), key=lambda t: (t.source_line, t.title))[:max_tasks]
 
     def _llm_summarize(self, speaker_text_map: Dict[str, List[str]]) -> List[str]:
-        self._load_deepseek_client()
-        if self.deepseek_client is None:
-            # fallback: эвристика
-            return self._generate_summary_paragraphs(speaker_text_map)
-
         joined = []
         for spk, txts in speaker_text_map.items():
             snippet = ' '.join(txts)
@@ -543,82 +596,18 @@ class TranscriptionService:
                 snippet = snippet[:5000].rsplit(' ', 1)[0] + '…'
             joined.append(f"{spk}: {snippet}")
         convo = "\n".join(joined)
-        if len(convo) > 15000:
-            convo = convo[:15000].rsplit(' ', 1)[0] + '…'
-
-        model_name = settings.tasks_model or "deepseek-ai/DeepSeek-R1"
-        if settings.tasks_provider and ':' not in model_name:
-            model_name = f"{model_name}:{settings.tasks_provider}"
 
         system_prompt = (
-            "Ты аналитик встреч. Получаешь диалог и возвращаешь структурированное краткое саммари. Формат вывода строками: \n"
-            "[Общее резюме]\n(1 абзац)\n"
-            "[Ключевые решения]\n- пункт 1\n- пункт 2\n"
-            "[Основные темы]\n- тема 1\n- тема 2\n"
-            "Требования: не выдумывай факты, не копируй длинные куски, сохраняй смысл; максимум 6-10 пунктов суммарно."
-        )
+            "Ты аналитик встречи. Верни структурированное саммари: [Общее резюме] абзац; [Ключевые решения] буллеты; [Основные темы] буллеты. Без выдумок.")
         user_prompt = f"Диалог:\n{convo}\n\nСформируй саммари."
+        raw = self._llm_chat([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ], model=settings.tasks_model)
 
-        def _call_model() -> str:
-            try:
-                completion = self.deepseek_client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.3,
-                    max_tokens=800,
-                )
-                choice0 = completion.choices[0]
-                if hasattr(choice0, 'message') and getattr(choice0.message, 'content', None):
-                    return choice0.message.content
-                if hasattr(choice0, 'text') and choice0.text:
-                    return choice0.text
-                return str(completion)
-            except Exception as e:
-                logger.error(f"Ошибка LLM саммари: {e}")
-                return ""
-
-        raw = _call_model()
-        raw = self._strip_deepseek_think(raw)
-        if not raw.strip():
-            logger.info("LLM пустой ответ саммари — fallback эвристика.")
-            return self._generate_summary_paragraphs(speaker_text_map)
-
-        # Разбиваем на строки/абзацы, убираем пустые
+        print(raw)
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        # Ограничим до 20
         return lines[:20]
-
-    def _strip_deepseek_think(self, text: str) -> str:
-        """Удаляет внутреннее рассуждение DeepSeek (think часть) оставляя только финальный вывод.
-        Удаляются:
-        - блоки <think>...</think>
-        - строки начинающиеся с Thought:/Thinking:/Reasoning:/Analysis:
-        - строки вида Internal reasoning ...
-        """
-        if not text:
-            return text
-        import re
-        text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
-        cleaned_lines: List[str] = []
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if re.match(r'^(thought|thinking|reasoning|analysis)[:\-]', stripped, flags=re.IGNORECASE):
-                continue
-            if stripped.lower().startswith('internal reasoning'):
-                continue
-            # Часто DeepSeek может вставлять маркер "Final Answer:" — уберём сам маркер
-            if stripped.lower().startswith('final answer:'):
-                stripped = stripped[len('final answer:'):].strip()
-            cleaned_lines.append(stripped)
-        # Удаляем ведущие служебные слова Answer:/Ответ:
-        if cleaned_lines and re.match(r'^(answer|ответ)[:\-]', cleaned_lines[0], flags=re.IGNORECASE):
-            cleaned_lines[0] = re.sub(r'^(answer|ответ)[:\-]\s*', '', cleaned_lines[0], flags=re.IGNORECASE)
-        return '\n'.join(cleaned_lines).strip()
 
     def analyze_text(self, req: AnalyzeRequest) -> AnalyzeResponse:
         raw_text = req.text.strip()
@@ -668,8 +657,8 @@ async def root():
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     models_loaded = {
-        "whisper": transcription_service.whisper_model is not None,
-        "diarization": transcription_service.diarization_pipeline is not None
+        "transcribe_model": transcription_service.transcribe_model is not None,
+        "voice_activity_detection": True
     }
 
     status_value = "healthy" if all(models_loaded.values()) else "unhealthy"
@@ -677,7 +666,9 @@ async def health_check():
     system_info = {
         "device": transcription_service.device,
         "cuda_available": torch.cuda.is_available(),
-        "torch_version": torch.__version__
+        "torch_version": torch.__version__,
+        "transcribe_model_path": settings.transcribe_model_path,
+        "model_exists": os.path.exists(settings.transcribe_model_path)
     }
 
     if torch.cuda.is_available():

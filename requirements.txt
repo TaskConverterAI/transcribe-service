@@ -6,15 +6,16 @@ pydantic-settings==2.1.0
 
 librosa==0.10.1
 soundfile==0.12.1
-openai-whisper==20231117
 
 torch==2.1.0
 torchaudio==2.1.0
 numpy>=1.21.0,<2.0.0
+scikit-learn>=1.2.0
 
-pyannote.audio==3.1.1
-huggingface_hub==0.24.0  # обновлено для InferenceClient
+vosk==0.3.44
+webrtcvad==2.0.10
 
 python-dotenv==1.0.0
-transformers==4.35.0
 openai>=1.0.0
+requests>=2.31.0
+ollama>=0.1.6
