@@ -407,8 +407,6 @@ class TranscriptionService:
 
             embeddings = np.zeros(shape=(len(segments), 192))
             for i, segment in enumerate(segments):
-                print("segment", segment)
-                embeddings[i] = segment_embedding(segment)
                 embeddings[i] = segment_embedding(segment)
             embeddings = np.nan_to_num(embeddings)
             print(f'Embedding shape: {embeddings.shape}')
