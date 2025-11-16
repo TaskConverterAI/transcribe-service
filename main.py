@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 import json
 import zipfile
 import urllib.request
-import pyannote.audio
 from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
 from pyannote.audio import Audio
 from pyannote.core import Segment
@@ -127,6 +126,10 @@ class AnalyzeResponse(BaseModel):
     tasks: List[TaskModel] = Field(..., description="Извлеченные задачи")
     participants: List[str] = Field(..., description="Список идентификаторов участников")
     total_lines: int = Field(..., description="Количество обработанных строк")
+
+
+class TranscribeByPathRequest(BaseModel):
+    file_path: str = Field(..., description="Локальный путь к аудио или видео файлу")
 
 
 class TranscriptionService:
@@ -375,31 +378,51 @@ class TranscriptionService:
             'segments': vosk_results
         }
 
-    async def process_audio_file(self, file: UploadFile) -> TranscriptionResponse:
+    async def process_audio_file(self, file_path: str) -> TranscriptionResponse:
         start_time = time.time()
         temp_files: List[str] = []
         try:
             if not self.transcribe_model:
                 await self.load_models()
-            self.validate_audio_file(file)
-            tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix='.input')
-            temp_files.append(tmp_in.name)
-            content = await file.read()
-            tmp_in.write(content)
-            tmp_in.close()
-            processed = self._preprocess_audio(tmp_in.name)
+
+            # Проверяем существование файла
+            if not os.path.exists(file_path):
+                logger.error(f"Файл не найден: {file_path}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Файл не найден: {file_path}"
+                )
+
+            # Проверяем формат файла по расширению
+            ext = os.path.splitext(file_path)[1].lower()
+            audio_exts = {'.wav', '.mp3', '.m4a', '.ogg', '.flac', '.aac'}
+            if ext not in audio_exts:
+                logger.error(f"Неподдерживаемый формат файла: {ext}. Поддерживаемые: {list(audio_exts)}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Неподдерживаемый формат файла: {ext}. Поддерживаемые: {list(audio_exts)}"
+                )
+
+            # Проверяем размер файла
+            file_size = os.path.getsize(file_path)
+            if file_size > settings.max_file_size:
+                logger.error(f"Файл слишком большой: {file_size // (1024 * 1024)}MB. Максимальный размер: {settings.max_file_size // (1024 * 1024)}MB")
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Файл слишком большой: {file_size // (1024 * 1024)}MB. Максимальный размер: {settings.max_file_size // (1024 * 1024)}MB"
+                )
+
+            processed = self._preprocess_audio(file_path)
             temp_files.append(processed)
             duration = librosa.get_duration(path=processed)
 
             transcribe_result = await self._transcribe_async(processed)
 
             segments = transcribe_result['segments']
-            print(segments)
             # Create embedding
             def segment_embedding(segment):
                 audio = Audio()
                 start = segment["start"]
-                print(start)
                 # Whisper overshoots the end timestamp in the last segment
                 end = min(duration, segment["end"])
                 clip = Segment(start, end)
@@ -683,8 +706,8 @@ async def health_check():
 
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
-async def transcribe_audio(file: UploadFile = File(..., description="Аудио файл для транскрибации")):
-    return await transcription_service.process_audio_file(file)
+async def transcribe_audio(req: TranscribeByPathRequest):
+    return await transcription_service.process_audio_file(req.file_path)
 
 
 @app.post("/analyze", response_model=AnalyzeResponse, summary="Анализ текста встречи")

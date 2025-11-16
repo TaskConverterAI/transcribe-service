@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     ollama_api_key: str = os.getenv("OLLAMA_API_KEY", "1c52a28399814d52a8e1961b5d71e438.MFK5Y1VlK2cRGIiEw_vnijQ4")
 
 
-    max_file_size: int = 25 * 1024 * 1024
+    max_file_size: int = 500 * 1024 * 1024
     supported_formats: List[str] = [
         "audio/wav", "audio/mp3", "audio/m4a", "audio/ogg",
         "audio/flac", "audio/aac", "video/mp4"

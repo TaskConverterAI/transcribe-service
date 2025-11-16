@@ -12,6 +12,21 @@
 - Эвристический (use_llm=false) — быстрый, на ключевых словах.
 - LLM (use_llm=true, по умолчанию) — использует HuggingFace модель (например Flan-T5) для генерации саммари и выделения задач.
 
+## Новое: поддержка видео (mp4)
+Теперь эндпоинт `/transcribe` принимает также видеофайлы (`.mp4`, а при необходимости можно расширить список). Аудио дорожка автоматически извлекается и приводится к WAV 16 kHz через `moviepy` и `ffmpeg`.
+
+Требования:
+- Установлен пакет `moviepy` (добавлен в `requirements.txt`).
+- В системе доступен бинарный `ffmpeg` (macOS: `brew install ffmpeg`).
+
+Пример запроса с видео:
+```bash
+curl -X POST http://localhost:8000/transcribe \
+  -H "Accept: application/json" \
+  -F "file=@test/2024-09-26\ 19-29-50.mp4;type=video/mp4"
+```
+Если в видео отсутствует аудио дорожка или `ffmpeg` не установлен, вернётся HTTP 400 с описанием.
+
 ## Установка
 ```bash
 git clone https://github.com/your-username/transcribe-service.git
@@ -50,7 +65,7 @@ python main.py
 
 ## Эндпоинты
 ### 1. /transcribe (POST)
-Принимает аудио файл. Пример запроса (curl):
+Принимает аудио или видео файл. Пример запроса (curl):
 ```bash
 curl -X POST http://localhost:8000/transcribe \
   -H "Accept: application/json" \
@@ -102,7 +117,7 @@ curl -X POST http://localhost:8000/analyze \
     }
   ],
   "participants": ["SPK1", "SPK2"],
-  "total_lines": 2
+      "total_lines": 2
 }
 ```
 Поле `use_llm` (true/false) переключает режим анализа.
@@ -130,7 +145,7 @@ TASKS_PROVIDER=novita
 - Whisper `large` требует значительных ресурсов; при ограничениях используйте `medium` или `small`.
 
 ## Пример сценария end-to-end
-1. Отправить аудио на `/transcribe`.
+1. Отправить аудио или видео на `/transcribe`.
 2. Из ответа собрать строки формата `speaker: text`.
 3. Передать их на `/analyze` с `use_llm=true`.
 4. Сохранить задачи в вашу систему управления (Jira, ClickUp и т.п.).
@@ -149,11 +164,13 @@ python test/test_client.py
 - Проверить `/health` для статуса загрузки моделей.
 - Логи выводятся в stdout (см. `setup_logging` в `config.py`).
 - Убедитесь, что `HUGGINGFACE_TOKEN` действительно имеет доступ к `pyannote/speaker-diarization-3.1`.
+- Для видео: убедитесь что установлен `ffmpeg` (`which ffmpeg`). Если нет — установите: `brew install ffmpeg`.
 
 ## Требования
 - Python 3.8+
 - Все зависимости из `requirements.txt`
 - GPU (опционально) для ускорения Whisper и диаризации
+- ffmpeg (для извлечения аудио из mp4)
 
 ## Лицензия
 MIT License
